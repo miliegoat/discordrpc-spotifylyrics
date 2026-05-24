@@ -136,6 +136,24 @@ function toIco(pngBuf) {
 }
 
 let trayProcess = null;
+let pollInterval = null;
+let syncTickInterval = null;
+
+function shutdown() {
+  clearInterval(lanyardHeartbeat);
+  lanyardHeartbeat = null;
+  clearInterval(pollInterval);
+  pollInterval = null;
+  clearInterval(syncTickInterval);
+  syncTickInterval = null;
+  if (lanyardWs) { try { lanyardWs.close(); } catch {} lanyardWs = null; }
+  saveCache();
+  try { rpc.clearActivity(); rpc.destroy(); } catch {}
+  if (trayProcess) {
+    try { trayProcess.kill(); } catch {}
+    trayProcess = null;
+  }
+}
 
 function updateTrayStatus(text) {
   if (!trayProcess) return;
@@ -157,18 +175,17 @@ function initTray() {
       const iconPath = fs.existsSync(customIcon) ? customIcon : path.join(os.tmpdir(), 'spotify-lyrics-rpc-icon.png');
       if (!fs.existsSync(customIcon)) try { fs.writeFileSync(iconPath, makeIcon(32, 29, 185, 84)); } catch {}
       trayProcess = spawn('python3', [path.join(__dirname, 'tray.py'), iconPath], { stdio: ['pipe', 'pipe', 'inherit'] });
-      trayProcess.on('exit', () => process.exit(0));
+      trayProcess.on('exit', () => shutdown());
       trayProcess.on('error', err => log('[tray] error:', err.message));
       const rl = require('readline').createInterface({ input: trayProcess.stdout });
       rl.on('line', line => {
         try {
           const msg = JSON.parse(line);
           if (msg.type === 'ready') log('[tray] initialized');
-          if (msg.type === 'clicked' && msg.item === 'exit') { trayProcess.kill(); process.exit(0); }
+          if (msg.type === 'clicked' && msg.item === 'exit') { shutdown(); }
         } catch {}
       });
     } else {
-      if (!process.env.GDK_BACKEND) process.env.GDK_BACKEND = 'x11';
       const SysTray = require('systray2').default;
       const customIcon = path.join(__dirname, '..', 'icon.png');
       let iconBase64;
@@ -187,7 +204,7 @@ function initTray() {
           ],
         }, debug: false, copyDir: true,
       });
-      trayProcess.onClick(action => { if (action.seq_id === 2) { trayProcess.kill(); process.exit(0); } });
+      trayProcess.onClick(action => { if (action.seq_id === 2) { shutdown(); } });
       log('[tray] initialized');
     }
   } catch (err) {
@@ -213,25 +230,83 @@ rpc.login({ clientId: CLIENT_ID }).catch(err => {
   log('[rpc] login failed:', err.message);
 });
 
+let lanyardWs = null;
+let lanyardHeartbeat = null;
+let noSpotifyCount = 0;
+
+function startLanyardPollFallback() {
+  const poll = () => {
+    fetch(`https://api.lanyard.rest/v1/users/${USER_ID}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data?.data?.spotify && data.data.spotify.song) {
+          noSpotifyCount = 0;
+          handleSpotify(data.data.spotify);
+        }
+      })
+      .catch(err => log('[lanyard] poll fallback error:', err.message));
+  };
+  poll();
+  return setInterval(poll, 30000);
+}
+
 function connectLanyard() {
-  const ws = new WebSocket(LANYARD_URL);
-  ws.on('open', () => {
-    ws.send(JSON.stringify({ op: 2, d: { subscribe_to_id: USER_ID } }));
+  lanyardWs = new WebSocket(LANYARD_URL);
+  lanyardWs.on('open', () => {
+    lanyardWs.send(JSON.stringify({ op: 2, d: { subscribe_to_id: USER_ID } }));
     log('[lanyard] connected');
   });
-  ws.on('message', raw => {
-    const { op, t, d } = JSON.parse(raw);
-    if (op !== 0) return;
-    if (t === 'INIT_STATE' && d.spotify) handleSpotify(d.spotify);
-    if (t === 'PRESENCE_UPDATE') {
-      if (d.spotify) handleSpotify(d.spotify);
-      else handleSpotify(null);
+  lanyardWs.on('message', raw => {
+    const data = JSON.parse(raw);
+    const { op, t, d } = data;
+
+    if (op === 1 && d?.heartbeat_interval) {
+      clearInterval(lanyardHeartbeat);
+      lanyardHeartbeat = setInterval(() => {
+        if (lanyardWs?.readyState === WebSocket.OPEN) {
+          lanyardWs.send(JSON.stringify({ op: 3 }));
+        }
+      }, d.heartbeat_interval);
+      return;
     }
-    if (t === 'SPOTIFY_UPDATE') handleSpotify(d);
+    if (op !== 0) return;
+
+    if (t === 'INIT_STATE') {
+      if (d.spotify) {
+        noSpotifyCount = 0;
+        handleSpotify(d.spotify);
+      }
+      return;
+    }
+    if (t === 'PRESENCE_UPDATE') {
+      if (d.spotify) {
+        noSpotifyCount = 0;
+        handleSpotify(d.spotify);
+      } else if (spotify) {
+        noSpotifyCount++;
+        if (noSpotifyCount >= 3) {
+          noSpotifyCount = 0;
+          handleSpotify(null);
+        }
+      } else {
+        handleSpotify(null);
+      }
+      return;
+    }
+    if (t === 'SPOTIFY_UPDATE') {
+      noSpotifyCount = 0;
+      handleSpotify(d);
+    }
   });
-  ws.on('close', () => setTimeout(connectLanyard, 3000));
-  ws.on('error', () => {});
+  lanyardWs.on('close', () => {
+    clearInterval(lanyardHeartbeat);
+    lanyardHeartbeat = null;
+    setTimeout(connectLanyard, 3000);
+  });
+  lanyardWs.on('error', err => log('[lanyard] ws error:', err.message));
 }
+
+pollInterval = startLanyardPollFallback();
 
 function handleSpotify(s) {
   if (!s || !s.song) {
@@ -327,7 +402,7 @@ function parseLRC(lrc) {
   return lrc.split('\n').map(line => {
     const m = line.match(/\[(\d+):(\d+)\.(\d+)\](.*)/);
     if (!m) return null;
-    const time = Number(m[1]) * 60 + Number(m[2]) + Number(m[3]) / 100;
+    const time = Number(m[1]) * 60 + Number(m[2]) + Number(m[3]) / 10 ** m[3].length;
     return { time, text: m[4].trim() };
   }).filter(Boolean);
 }
@@ -408,5 +483,5 @@ function syncTick() {
   });
 }
 
-setInterval(syncTick, 200);
+syncTickInterval = setInterval(syncTick, 200);
 log('[boot] ready');
