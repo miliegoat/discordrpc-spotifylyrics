@@ -1,6 +1,9 @@
 {
   "name": "spotify-lyrics-rpc",
   "private": true,
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "discord-rpc": "^4.0.1",
     "systray2": "^2.1.4",
