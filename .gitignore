@@ -3,4 +3,3 @@ id
 lyrics-cache.json
 __pycache__/
 *.log
-autostart.vbs
